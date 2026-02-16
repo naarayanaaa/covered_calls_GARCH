@@ -9,7 +9,7 @@ from .config import Config
 from .io.ingest import fetch_data
 from .features.resistance import detect_resistance
 from .options.cleaning import clean_options
-from .options.iv_surface import fit_svi, get_iv_from_surface
+from .options.iv_surface import fit_svi
 from .models.garch import GarchModel
 from .montecarlo.breach import calculate_probabilities
 from .optimizer.choose_strike import select_strike
@@ -35,34 +35,37 @@ def main():
     
     print(f"--- Starting Analysis for {cfg.ticker} ---")
     
-# 1. Ingest
+    # 1. Ingest
     print("Fetching data...")
     daily, intraday, opts, spot = fetch_data(cfg.ticker)
 
-    # --- FIX START ---
     # Calculate Log Returns safely
     daily['prev_close'] = daily['close'].shift(1)
     
-    # 1. Drop rows where price is 0 or NaN to avoid divide-by-zero or log(0) errors
+    # Drop rows where price is 0 or NaN
     daily = daily[(daily['close'] > 0) & (daily['prev_close'] > 0)]
     
-    # 2. Calculate log returns
+    # Calculate log returns
     daily['log_ret'] = np.log(daily['close'] / daily['prev_close'])
     
-    # 3. Explicitly drop NaN and Infinite values
+    # Explicitly drop NaN and Infinite values
     daily = daily.dropna(subset=['log_ret'])
     daily = daily[np.isfinite(daily['log_ret'])]
+    
+    # Verification: Check sufficient data for GARCH
+    if len(daily) < 252: # Prefer at least 1 year, but hard stop at something small
+        print(f"Error: Insufficient daily data ({len(daily)} rows). Need at least 252.")
+        return
     
     if daily.empty:
         print("Error: No valid daily return data after cleaning.")
         return
-    # --- FIX END ---
 
-    # 2. Resistance
+    # 2. Resistance (Clustered)
     print("Detecting resistance...")
-    # ... rest of the code ...
-    res_df = detect_resistance(daily, intraday, spot)
-    print(f"Immediate Resistance: {res_df.iloc[0]['level']:.2f} ({res_df.iloc[0]['type']})")
+    res_df = detect_resistance(daily, intraday, spot, cfg.res_zone_width)
+    if not res_df.empty:
+        print(f"Immediate Resistance Zone: {res_df.iloc[0]['level']:.2f} (Str: {res_df.iloc[0]['strength']:.1f})")
     
     # 3. Model Fitting
     print("Fitting GARCH Model...")
@@ -88,20 +91,18 @@ def main():
         clean_group = clean_options(group)
         if clean_group.empty: continue
         
-        # Fit SVI Surface (Calls + Puts)
-        # Using OTM options for fitting is standard
-        # Simple implementation: use mids
+        # Fit SVI Surface
         strikes = clean_group['strike'].values
-        ivs = clean_group['impliedVolatility'].values # from Yahoo
-        # If Yahoo IVs are bad/missing, we should solve BS. 
-        # For this script we assume Yahoo IVs are populated or use fallback.
-        # Fallback: fillna with mean
+        # Fill missing IVs with naive mean if necessary for fitting attempt
         clean_group['impliedVolatility'] = clean_group['impliedVolatility'].fillna(0.5)
+        ivs = clean_group['impliedVolatility'].values
         
-        # Run Monte Carlo for each strike in Calls
         T_years = dte / 365.0
         if T_years == 0: T_years = 1/365.0
         
+        svi_params = fit_svi(strikes, ivs, T_years, spot)
+        
+        # Run Monte Carlo for each strike in Calls
         # Simulate Paths
         n_days = max(int(dte), 1) # Trading days approx
         sim_prices, last_vol = garch.simulate_paths(n_days, cfg.mc_paths, spot)
@@ -110,6 +111,7 @@ def main():
         calls = clean_group[clean_group['side'] == 'call']
         
         for k in calls['strike'].unique():
+            # Pass scalar last_vol (daily)
             p_otm, se_otm, p_touch = calculate_probabilities(
                 sim_prices, k, T_years, last_vol
             )
@@ -118,12 +120,12 @@ def main():
             lcb = p_otm - z_score * se_otm
             p_otm_dict[k] = (p_otm, lcb, p_touch)
             
-        # Optimize
-        rec = select_strike(clean_group, p_otm_dict, res_df, cfg)
+        # Optimize with SVI params
+        rec = select_strike(clean_group, p_otm_dict, res_df, cfg, svi_params)
         if rec:
             rec['dte'] = dte
             recommendations.append(rec)
-            print(f"  -> Recommended: Strike {rec['strike']} (Prob: {rec['p_otm']:.2%}, Yield: {rec['yield']:.2%})")
+            print(f"  -> Recommended: Strike {rec['strike']} (Prob: {rec['p_otm']:.2%}, Delta: {rec['delta']:.2f})")
         else:
             print("  -> No feasible strike found.")
 

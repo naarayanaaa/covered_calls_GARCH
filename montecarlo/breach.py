@@ -23,16 +23,40 @@ def brownian_bridge_touch(S_start, S_end, Barrier, sigma, dt):
     arg = -2 * (b - x0) * (b - xT) / (sigma**2 * dt)
     return np.exp(arg)
 
+@jit(nopython=True)
+def _bridge_loop(prices, strike, T_years, vol_annual):
+    n_paths = prices.shape[0]
+    total_touch_prob = 0.0
+    
+    for i in range(n_paths):
+        # 1. Discrete check (Max of path)
+        path_max = -np.inf
+        for p in prices[i]:
+            if p > path_max:
+                path_max = p
+        
+        if path_max >= strike:
+            total_touch_prob += 1.0
+        else:
+            # 2. Bridge check (Conditional probability)
+            # using start and end of the full path
+            s_start = prices[i, 0]
+            s_end = prices[i, -1]
+            
+            # vol is annualized, dt is T_years
+            prob = brownian_bridge_touch(s_start, s_end, strike, vol_annual, T_years)
+            total_touch_prob += prob
+            
+    return total_touch_prob / n_paths
+
 def calculate_probabilities(prices, strike, T_years, vol_daily):
     """
     prices: (n_paths, n_steps + 1)
     strike: float
     T_years: float
-    vol_daily: array of volatilities (approx)
+    vol_daily: scalar volatility (daily)
     """
     n_paths, n_steps = prices.shape
-    n_steps -= 1
-    dt = T_years / n_steps
     
     # 1. Terminal Breach (Expires ITM)
     final_prices = prices[:, -1]
@@ -43,21 +67,10 @@ def calculate_probabilities(prices, strike, T_years, vol_daily):
     # 2. Standard Error for P_OTM
     se_otm = np.sqrt(p_otm * (1 - p_otm) / n_paths)
     
-    # 3. Path Breach (Touch)
-    # Discrete check
-    max_prices = np.max(prices, axis=1)
-    discrete_touch = max_prices >= strike
+    # 3. Path Breach (Touch) with Bridge Correction
+    # Convert daily vol to annual for the bridge formula (assuming T_years is annual)
+    vol_annual = vol_daily * np.sqrt(365.0)
     
-    # Bridge correction for paths that didn't discretely touch
-    # For each step, calculate prob of touching.
-    # P(Touch_Total) = 1 - Product(1 - P(Touch_Step_i))
-    
-    # Vectorized bridge is memory intensive, so we do a simplified check
-    # We only apply bridge to paths that haven't touched discretely
-    # This is a complex optimization, for this script we stick to Discrete Max 
-    # for speed unless numba loop is fully implemented.
-    # (Implementation of full path bridge omitted for brevity, using discrete + buffer)
-    
-    p_touch = np.mean(discrete_touch)
+    p_touch = _bridge_loop(prices, float(strike), float(T_years), float(vol_annual))
     
     return p_otm, se_otm, p_touch

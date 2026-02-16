@@ -1,16 +1,19 @@
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from options.iv_surface import get_iv_from_surface
+from options.greeks import calculate_delta
 
 def select_strike(
     df_opts: pd.DataFrame, 
     p_otm_dict: dict, 
     resistance_df: pd.DataFrame, 
-    config
+    config,
+    svi_params=None
 ):
     """
     df_opts: options chain for ONE expiry
     p_otm_dict: {strike: (p_otm, lcb, p_touch)}
+    svi_params: Fitted SVI parameters for this expiry (optional)
     """
     if df_opts.empty: return None
 
@@ -26,8 +29,10 @@ def select_strike(
     if res_candidates.empty:
         # No resistance found? fallback
         res_level = spot * 1.10
+        res_strength = 1.0
     else:
         res_level = res_candidates.iloc[0]['level']
+        res_strength = res_candidates.iloc[0]['strength']
 
     for idx, row in calls.iterrows():
         K = row['strike']
@@ -37,26 +42,43 @@ def select_strike(
         if K not in p_otm_dict: continue
         p_otm, p_lcb, p_touch = p_otm_dict[K]
         
-        # Constraint: LCB >= Target
+        # 1. Constraint: LCB >= Target
         if p_lcb < config.p_target_min:
             continue
             
-        # Constraint: P_Touch <= Cap
+        # 2. Constraint: P_Touch <= Cap
         if config.touch_cap and p_touch > config.touch_cap:
+            continue
+            
+        # 3. Model IV & Delta (Risk Control)
+        T_years = max(row['dte'], 1) / 365.0
+        
+        if svi_params is not None:
+            model_iv = get_iv_from_surface(K, T_years, spot, svi_params)
+        else:
+            # Fallback to market IV if SVI fit failed
+            model_iv = row['impliedVolatility']
+            
+        delta = calculate_delta(spot, K, T_years, risk_free=0.04, vol=model_iv)
+        
+        # 4. Constraint: Max Delta
+        if delta > config.max_delta:
             continue
             
         # Metric: Distance to Resistance
         dist_res = abs(K - res_level)
         
         # Metric: Premium Yield (Annualized)
-        # Yield = (Premium / Spot) * (365 / DTE)
         dte = max(row['dte'], 1)
         yld = (row['mid'] / spot) * (365 / dte)
         
         # Objective Function
-        # Maximize Yield - Penalty * Distance
+        # Score = Yield - Resistance_Penalty - Risk_Penalty
         # We normalize distance by spot
-        score = yld - config.lambda_res * (dist_res / spot)
+        
+        score = yld \
+                - config.lambda_res * (dist_res / spot) \
+                - config.lambda_risk * delta
         
         candidates.append({
             'strike': K,
@@ -68,7 +90,10 @@ def select_strike(
             'p_otm': p_otm,
             'p_lcb': p_lcb,
             'p_touch': p_touch,
+            'model_iv': model_iv,
+            'delta': delta,
             'resistance': res_level,
+            'res_strength': res_strength,
             'dist_res': dist_res,
             'yield': yld,
             'score': score

@@ -44,9 +44,14 @@ def fetch_data(ticker: str, lookback_years: int = 6):
         dte = (exp_date - today).days
         if 0 <= dte <= 45:
             try:
+                # Robust fetch
                 chain = tk.option_chain(exp_str)
                 calls = chain.calls
                 puts = chain.puts
+                
+                if calls.empty and puts.empty:
+                    continue
+                    
                 calls['side'] = 'call'
                 puts['side'] = 'put'
                 
@@ -54,14 +59,14 @@ def fetch_data(ticker: str, lookback_years: int = 6):
                 df['expiration'] = exp_date
                 df['dte'] = dte
                 
-                # --- ADD THIS LINE ---
+                # Stamp underlying price
                 df['underlying_price'] = spot
-                # ---------------------
                 
                 options_dfs.append(df)
             except Exception as e:
-                # It is common for some expiries to fail or be empty
-                pass
+                # Log warning but continue
+                print(f"Skipping expiry {exp_str}: Data unavailable ({e})")
+                continue
 
     if not options_dfs:
         raise ValueError("No options data found within DTE window.")
