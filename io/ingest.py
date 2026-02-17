@@ -1,76 +1,35 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+from .interface import DataProvider
+from .yahoo_feed import YahooProvider
+from .alpaca_feed import AlpacaProvider
+from ..config import Config
 
 def fetch_data(ticker: str, lookback_years: int = 6):
-    """Fetches daily, intraday, and options chain."""
-    tk = yf.Ticker(ticker)
+    """
+    Factory function to fetch data from the configured provider.
+    Returns: (daily_df, intraday_df, options_df, spot_price)
+    """
+    cfg = Config()
+    provider_name = cfg.api_provider.lower()
     
-    # 1. Daily History (for GARCH)
-    daily = tk.history(period=f"{lookback_years}y", interval="1d", auto_adjust=False)
-    if daily.empty:
-        raise ValueError(f"No daily data for {ticker}")
-    daily = daily.reset_index()
-    # Normalize columns
-    cols = {c: c.lower() for c in daily.columns}
-    daily = daily.rename(columns=cols)
-    if 'date' in daily.columns: daily = daily.rename(columns={'date': 'timestamp'})
-    daily['timestamp'] = pd.to_datetime(daily['timestamp']).dt.tz_localize(None)
-
-    # 2. Intraday (for VWAP/0-7 DTE context)
-    # yfinance limits: 7d for 1m, 60d for 5m. We try 5m.
-    intraday = tk.history(period="60d", interval="5m", auto_adjust=False)
-    if not intraday.empty:
-        intraday = intraday.reset_index().rename(columns={c: c.lower() for c in intraday.columns})
-        if 'datetime' in intraday.columns: intraday = intraday.rename(columns={'datetime': 'timestamp'})
+    provider: DataProvider = None
     
-    # 3. Spot Price
-    try:
-        spot = tk.fast_info['last_price']
-    except:
-        spot = daily['close'].iloc[-1]
-
-    # 4. Options Chain
-    # We fetch all expiries within 0-45 days
-    expiries = tk.options
-    today = datetime.now()
-    valid_exps = []
-    
-    options_dfs = []
-    
-    for exp_str in expiries:
-        exp_date = pd.to_datetime(exp_str)
-        dte = (exp_date - today).days
-        if 0 <= dte <= 45:
-            try:
-                # Robust fetch
-                chain = tk.option_chain(exp_str)
-                calls = chain.calls
-                puts = chain.puts
-                
-                if calls.empty and puts.empty:
-                    continue
-                    
-                calls['side'] = 'call'
-                puts['side'] = 'put'
-                
-                df = pd.concat([calls, puts])
-                df['expiration'] = exp_date
-                df['dte'] = dte
-                
-                # Stamp underlying price
-                df['underlying_price'] = spot
-                
-                options_dfs.append(df)
-            except Exception as e:
-                # Log warning but continue
-                print(f"Skipping expiry {exp_str}: Data unavailable ({e})")
-                continue
-
-    if not options_dfs:
-        raise ValueError("No options data found within DTE window.")
+    if provider_name == "alpaca":
+        try:
+            print(f"--- Initializing Alpaca Provider for {ticker} ---")
+            provider = AlpacaProvider()
+        except ImportError:
+            print("Error: alpaca-py not installed. Falling back to Yahoo.")
+            provider = YahooProvider()
+        except ValueError as e:
+            print(f"Error: {e}. Falling back to Yahoo.")
+            provider = YahooProvider()
+            
+    elif provider_name == "yahoo":
+        print(f"--- Initializing Yahoo Provider for {ticker} ---")
+        provider = YahooProvider()
         
-    options = pd.concat(options_dfs, ignore_index=True)
-    
-    return daily, intraday, options, spot
+    else:
+        print(f"Unknown provider '{provider_name}'. Defaulting to Yahoo.")
+        provider = YahooProvider()
+        
+    return provider.fetch_data(ticker, lookback_years)

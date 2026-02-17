@@ -10,21 +10,14 @@ def select_strike(
     config,
     svi_params=None
 ):
-    """
-    df_opts: options chain for ONE expiry
-    p_otm_dict: {strike: (p_otm, lcb, p_touch)}
-    svi_params: Fitted SVI parameters for this expiry (optional)
-    """
     if df_opts.empty: return None
 
     # Filter to Calls
     calls = df_opts[df_opts['side'] == 'call'].copy()
-    
     candidates = []
-    
     spot = calls['underlying_price'].iloc[0]
     
-    # Get Immediate Resistance (First one above spot)
+    # Get Immediate Resistance
     res_candidates = resistance_df[resistance_df['level'] > spot]
     if res_candidates.empty:
         res_level = spot * 1.10
@@ -46,39 +39,20 @@ def select_strike(
         if oi < config.min_oi:
             print(f"Strike {K}: REJECTED (Low OI: {oi} < {config.min_oi})")
             continue
-            
-        # Get Probabilities
-        if K not in p_otm_dict: 
-            print(f"Strike {K}: REJECTED (No Prob Data)")
-            continue
-        p_otm, p_lcb, p_touch = p_otm_dict[K]
         
-        # 1. Constraint: LCB >= Target
-        if p_lcb < config.p_target_min:
-            print(f"Strike {K}: REJECTED (Unsafe: LCB {p_lcb:.2%} < {config.p_target_min:.1%})")
+        # --- Task 3: Zombie & Spread Filter ---
+        if row['bid'] < 0.05:
+            print(f"Strike {K}: REJECTED (Zombie Quote: Bid {row['bid']:.2f})")
             continue
             
-        # 2. Constraint: P_Touch <= Cap
-        if config.touch_cap and p_touch > config.touch_cap:
-            print(f"Strike {K}: REJECTED (Touch Risk: {p_touch:.2%} > {config.touch_cap:.1%})")
-            continue
-            
-        # 3. Model IV & Delta
-        T_years = max(row['dte'], 1) / 365.0
+        if row['bid'] > 0:
+            spread_pct = (row['ask'] - row['bid']) / row['bid']
+            if spread_pct > 0.5:
+                print(f"Strike {K}: REJECTED (Wide Spread: {spread_pct:.1%})")
+                continue
         
-        if svi_params is not None:
-            model_iv = get_iv_from_surface(K, T_years, spot, svi_params)
-        else:
-            model_iv = row['impliedVolatility']
-            
-        delta = calculate_delta(spot, K, T_years, risk_free=0.04, vol=model_iv)
-        
-        # 4. Constraint: Max Delta
-        if delta > config.max_delta:
-            print(f"Strike {K}: REJECTED (High Delta: {delta:.2f} > {config.max_delta})")
-            continue
-            
-        # --- Task 2: Effective Premium Calculation ---
+        # --- Task 4: Transaction Costs & Net Premium ---
+        # Calculate Effective Price first
         bid = row['bid']
         ask = row['ask']
         mid = row['mid']
@@ -90,16 +64,54 @@ def select_strike(
         else:
             effective_price = bid + (config.liquidity_crossing_factor * spread)
             
-        dte = max(row['dte'], 1)
-        yld = (effective_price / spot) * (365 / dte)
+        # Commission Logic (Interactive Brokers)
+        gross_premium = effective_price * 100
+        net_premium = gross_premium - config.commission_fee
         
+        if net_premium < config.min_premium_abs:
+            print(f"Strike {K}: REJECTED (Net Premium ${net_premium:.2f} < ${config.min_premium_abs})")
+            continue
+            
+        # Re-calculate yield based on Net Premium (per share basis)
+        net_price_per_share = net_premium / 100.0
+        dte = max(row['dte'], 1)
+        yld = (net_price_per_share / spot) * (365 / dte)
+
+        # Get Probabilities
+        if K not in p_otm_dict: 
+            print(f"Strike {K}: REJECTED (No Prob Data)")
+            continue
+        p_otm, p_lcb, p_touch = p_otm_dict[K]
+        
+        # Constraints
+        if p_lcb < config.p_target_min:
+            print(f"Strike {K}: REJECTED (Unsafe: LCB {p_lcb:.2%} < {config.p_target_min:.1%})")
+            continue
+            
+        if config.touch_cap and p_touch > config.touch_cap:
+            print(f"Strike {K}: REJECTED (Touch Risk: {p_touch:.2%} > {config.touch_cap:.1%})")
+            continue
+            
+        # Model IV & Delta
+        T_years = max(row['dte'], 1) / 365.0
+        if svi_params is not None:
+            model_iv = get_iv_from_surface(K, T_years, spot, svi_params)
+        else:
+            model_iv = row['impliedVolatility']
+            
+        delta = calculate_delta(spot, K, T_years, risk_free=0.04, vol=model_iv)
+        
+        if delta > config.max_delta:
+            print(f"Strike {K}: REJECTED (High Delta: {delta:.2f} > {config.max_delta})")
+            continue
+            
         dist_res = abs(K - res_level)
         
         score = yld \
                 - config.lambda_res * (dist_res / spot) \
                 - config.lambda_risk * delta
         
-        print(f"Strike {K}: ACCEPTED (Score: {score:.4f}, Prob: {p_lcb:.1%})")
+        print(f"Strike {K}: ACCEPTED (Score: {score:.4f}, Prob: {p_lcb:.1%}, Net: ${net_premium:.2f})")
 
         candidates.append({
             'strike': K,
@@ -109,6 +121,7 @@ def select_strike(
             'ask': ask,
             'mid': mid,
             'effective_price': effective_price,
+            'net_premium': net_premium,  # Store net
             'p_otm': p_otm,
             'p_lcb': p_lcb,
             'p_touch': p_touch,

@@ -62,6 +62,9 @@ class GarchModel:
         cum_ret = np.cumsum(log_ret, axis=1)
         prices = current_price * np.exp(cum_ret)
         
+        # --- FIX: Clamp Price to prevent overflow in long-dated simulations ---
+        prices = np.minimum(prices, current_price * 5.0)
+        
         # Prepend current price
         prices = np.hstack([np.full((n_paths, 1), current_price), prices])
         

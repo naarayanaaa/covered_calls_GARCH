@@ -4,9 +4,10 @@ import numpy as np
 import json
 import os
 import glob
+import yfinance as yf
 from datetime import datetime
 
-# Relative imports for package execution
+# Relative imports
 from .config import Config
 from .io.ingest import fetch_data
 from .features.resistance import detect_resistance
@@ -38,6 +39,36 @@ def load_earnings_dates(ticker, base_dir):
         else: return pd.read_csv(latest_file)
     except: return pd.DataFrame()
 
+def get_next_earnings_live(ticker):
+    """Fetches the next earnings date directly from yfinance API as a fallback."""
+    try:
+        tk = yf.Ticker(ticker)
+        cal = tk.calendar
+        if cal is None: return None
+            
+        dates = []
+        if isinstance(cal, dict):
+            for k, v in cal.items():
+                if 'Earnings' in str(k):
+                    if isinstance(v, list): dates.extend(v)
+                    else: dates.append(v)
+        elif isinstance(cal, pd.DataFrame):
+            dates = cal.iloc[0].tolist()
+            
+        now = datetime.now()
+        future_dates = []
+        for d in dates:
+            if isinstance(d, (datetime, pd.Timestamp)):
+                dt = pd.to_datetime(d).to_pydatetime()
+            else: continue
+            if dt > now: future_dates.append(dt)
+        
+        if future_dates: return min(future_dates)
+    except Exception as e:
+        print(f"  [Warning] Live earnings fetch failed: {e}")
+        return None
+    return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ticker", type=str, default="GME")
@@ -52,6 +83,7 @@ def main():
     print("Fetching data...")
     daily, intraday, opts, spot = fetch_data(cfg.ticker)
 
+    # Data Prep
     daily['prev_close'] = daily['close'].shift(1)
     daily = daily[(daily['close'] > 0) & (daily['prev_close'] > 0)]
     daily['log_ret'] = np.log(daily['close'] / daily['prev_close'])
@@ -65,13 +97,36 @@ def main():
         print("Error: No valid daily return data.")
         return
 
+    # --- Earnings Logic (Priority: Manual > Local > Live) ---
     earnings_df = load_earnings_dates(cfg.ticker, args.out_dir)
-    if not earnings_df.empty:
-        print("Earnings data loaded. Event Shield Active.")
+    next_earnings_date = None
+    
+    # 1. Manual Config
+    if cfg.manual_next_earnings_date:
+        try:
+            next_earnings_date = pd.to_datetime(cfg.manual_next_earnings_date).to_pydatetime()
+            print(f"  [Config] Using Manual Earnings Date: {next_earnings_date.date()}. Event Shield Active.")
+        except:
+            print("  [Error] Invalid manual earnings date format in config.")
+
+    # 2. Local File
+    if not next_earnings_date and not earnings_df.empty:
+        print("Earnings data loaded from local file.")
         if 'earnings_date' in earnings_df.columns:
             earnings_df['earnings_date'] = pd.to_datetime(earnings_df['earnings_date']).dt.tz_localize(None)
-    else:
-        print("Warning: Earnings data not found. Event Shield DISABLED.")
+            future_earnings = earnings_df[earnings_df['earnings_date'] > datetime.now()]
+            if not future_earnings.empty:
+                next_earnings_date = future_earnings.iloc[0]['earnings_date']
+                print(f"  -> Local Earnings Found: {next_earnings_date.date()}")
+
+    # 3. Live Fetch
+    if not next_earnings_date:
+        print("Warning: No local/manual earnings data. Attempting live fetch...")
+        next_earnings_date = get_next_earnings_live(cfg.ticker)
+        if next_earnings_date:
+            print(f"  -> Live Earnings Found: {next_earnings_date.date()}. Event Shield Active.")
+        else:
+            print("  -> Live fetch failed. Event Shield DISABLED.")
 
     print("Detecting resistance...")
     res_df = detect_resistance(daily, intraday, spot, cfg.res_zone_width)
@@ -93,22 +148,17 @@ def main():
             
         print(f"Processing DTE {dte} ({exp_date.date()})...")
         
-        if not earnings_df.empty:
-            future_earnings = earnings_df[earnings_df['earnings_date'] > today]
-            if not future_earnings.empty:
-                next_earn = future_earnings.iloc[0]['earnings_date']
-                days_to_earn = (next_earn - today).days
-                if 0 <= days_to_earn <= dte + 1:
-                    print(f"  [SKIP] Earnings in {days_to_earn} days.")
-                    continue
+        # --- Event Shield Check ---
+        if next_earnings_date:
+            days_to_earn = (next_earnings_date - today).days
+            if 0 <= days_to_earn <= dte + 1:
+                print(f"  [SKIP] Earnings in {days_to_earn} days (Date: {next_earnings_date.date()}).")
+                continue
 
-        # --- FIX: Pass Config & Add Diagnostics ---
         clean_group = clean_options(group, min_oi=cfg.min_oi)
-        
         if clean_group.empty:
-            print(f"  [WARNING] All {len(group)} options dropped by cleaner (Check Bid/Ask/OI).")
+            print(f"  [WARNING] All {len(group)} options dropped by cleaner.")
             continue
-        # ------------------------------------------
         
         strikes = clean_group['strike'].values
         clean_group['impliedVolatility'] = clean_group['impliedVolatility'].fillna(0.5)
@@ -123,14 +173,12 @@ def main():
         garch_vol_annual = last_garch_sigma * np.sqrt(252)
         
         calls = clean_group[clean_group['side'] == 'call']
+        market_iv = 0.0
         if not calls.empty:
             idx_atm = (calls['strike'] - spot).abs().idxmin()
             market_iv = calls.loc[idx_atm, 'impliedVolatility']
-        else:
-            market_iv = 0.0
             
         simulation_vol = last_garch_sigma
-        
         if market_iv > 2.0 * garch_vol_annual:
             print(f"  [WARNING] Market IV ({market_iv:.2%}) > 2.0x GARCH. Using Market IV.")
             simulation_vol = market_iv / np.sqrt(252)
@@ -151,7 +199,10 @@ def main():
         if rec:
             rec['dte'] = dte
             recommendations.append(rec)
-            print(f"  -> Recommended: Strike {rec['strike']} (Prob: {rec['p_otm']:.2%}, Eff.Yield: {rec['yield']:.2%})")
+            # Show net premium in logs
+            gross = rec['effective_price'] * 100
+            net = gross - cfg.commission_fee
+            print(f"  -> Recommended: Strike {rec['strike']} (Prob: {rec['p_otm']:.2%}, Net Profit: ${net:.2f}, Yield: {rec['yield']:.2%})")
         else:
             print("  -> No feasible strike found.")
 
