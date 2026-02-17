@@ -12,8 +12,8 @@ class Config:
     
     # Data Provider Configuration
     api_provider: str = os.getenv("API_PROVIDER", "alpaca")
-    alpaca_key: str = os.getenv("ALPACA_KEY", "PKB63ZCT3D6P2G5EKN5DJOD7A5")
-    alpaca_secret: str = os.getenv("ALPACA_SECRET", "6wJQqcKWB22M5TQXKWFhXt6BH3g8vz3jkkL85ELTeNzs")
+    alpaca_key: str = os.getenv("ALPACA_KEY", "")
+    alpaca_secret: str = os.getenv("ALPACA_SECRET", "")
     alpaca_endpoint: str = os.getenv("ALPACA_ENDPOINT", "https://paper-api.alpaca.markets")
 
     # Strategy Parameters
