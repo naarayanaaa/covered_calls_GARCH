@@ -51,7 +51,12 @@ class GarchModel:
             # Update variance for next step
             # I indicator
             I = (eps < 0).astype(float)
-            current_vol_sq = omega + (alpha + gamma * I) * (eps**2) + beta * current_vol_sq
+            next_vol_sq = omega + (alpha + gamma * I) * (eps**2) + beta * current_vol_sq
+            # --- FIX: Clamp Variance to avoid overflow ---
+            # Cap volatility at 500% daily (insanely high, but prevents infinity)
+            # 500% daily variance approx 25.0 (since returns are scaled by 100, variance is scaled by 10000)
+            # A daily return of 20% is variance 400. Let's cap at 10,000 (100% daily move).
+            current_vol_sq = np.minimum(next_vol_sq, 10000.0)
             
         # Cumsum to get prices
         cum_ret = np.cumsum(log_ret, axis=1)
